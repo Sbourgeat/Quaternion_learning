@@ -88,25 +88,39 @@ def quat_finder(images):
         rotation_matrix = principal_components.T
         rotation_quaternion = R.from_matrix(rotation_matrix).as_quat()
         quaternions.append(rotation_quaternion)
+
     quaternions = torch.from_numpy(np.array(quaternions))
 
     return quaternions
 
 class CustomDataset(Dataset):
-    
     def __init__(self, source_images, downsampling_factor):
         self.source_images = torch.tensor(source_images, dtype=torch.float32)
-        self.source_images = self.source_images.permute(0, 4, 2, 3, 1)
+        
+        # Assurez-vous que la forme est correcte avant d'interpoler
+        print("Initial shape:", self.source_images.shape)
+        
+        # Interpolation attend (batch_size, channels, depth, height, width)
+        self.source_images = self.source_images.permute(0, 4, 2, 3, 1)  # Reorder to match (N, C, D, H, W)
+        
+        print("Shape before interpolation:", self.source_images.shape)
+        
         self.source_images = torch.nn.functional.interpolate(
-            self.source_images, scale_factor=1 / downsampling_factor
+            self.source_images, scale_factor=1 / downsampling_factor, mode='trilinear', align_corners=False
         )
-        self.source_images = self.source_images.permute(0, 2, 3, 4, 1)
-    
-    def __len__(self):
-        return len(self.source_images)
+        
+        print("Shape after interpolation:", self.source_images.shape)
+        
+        self.source_images = self.source_images.permute(0, 2, 3, 4, 1)  # Revert to original order (N, D, H, W, C)
 
-    def __getitem__(self, idx):
-        return self.source_images[idx]
+        def __len__(self):
+
+            return len(self.source_images)
+
+        def __getitem__(self, idx):
+            # Retourner l'image à l'index donné
+            return self.source_images[idx]
+
 
 # Définition du modèle
 
@@ -176,106 +190,29 @@ def test_model(model, test_loader):
     print(f'Average test loss: {total_loss/len(test_loader):.4f}')
 
 
-def synchronized_transform_3d(image_tensor1, image_tensor2):
-    
-    # Paramètres aléatoires pour la transformation affine
-    angle = np.random.uniform(-15, 15)  # Rotation aléatoire en degrés
-    translation = np.random.uniform(-0.1, 0.1, size=3)  # Translation aléatoire
-    scale = np.random.uniform(0.8, 1.2)  # Échelle aléatoire
-    shear = np.random.uniform(-10, 10)  # Cisaillement aléatoire
-
-    # Matrice de transformation affine 3D aléatoire
-    matrix = torch.tensor([[
-        [scale * np.cos(np.radians(angle)), -np.sin(np.radians(angle)), shear, translation[0]],
-        [np.sin(np.radians(angle)), scale * np.cos(np.radians(angle)), shear, translation[1]],
-        [shear, shear, scale, translation[2]]
-    ]], dtype=torch.float32)
-
-    # Appliquer la transformation affine aux deux images
-    affine_grid1 = F.affine_grid(matrix, image_tensor1.size(), align_corners=False)
-    transformed_image1 = F.grid_sample(image_tensor1, affine_grid1, align_corners=False)
-    
-    affine_grid2 = F.affine_grid(matrix, image_tensor2.size(), align_corners=False)
-    transformed_image2 = F.grid_sample(image_tensor2, affine_grid2, align_corners=False)
-
-    # Paramètres aléatoires pour la déformation élastique
-    alpha = np.random.uniform(1000, 3000)  # Force de la déformation
-    sigma = np.random.uniform(30, 80)  # Douceur de la déformation
-
-    # Créer des déplacements aléatoires
-    random_state = np.random.RandomState(None)
-    shape = transformed_image1.shape[-3:]
-    dx = ndi.gaussian_filter((random_state.rand(*shape) * 2 - 1), sigma, mode="constant", cval=0) * alpha
-    dy = ndi.gaussian_filter((random_state.rand(*shape) * 2 - 1), sigma, mode="constant", cval=0) * alpha
-    dz = ndi.gaussian_filter((random_state.rand(*shape) * 2 - 1), sigma, mode="constant", cval=0) * alpha
-
-    # Appliquer les déplacements aux deux images
-    x, y, z = np.meshgrid(np.arange(shape[0]), np.arange(shape[1]), np.arange(shape[2]), indexing='ij')
-    indices = np.reshape(x + dx, (-1, 1)), np.reshape(y + dy, (-1, 1)), np.reshape(z + dz, (-1, 1))
-    
-    distorted_image1 = ndi.map_coordinates(transformed_image1.numpy()[0], indices, order=1, mode='reflect').reshape(shape)
-    distorted_image2 = ndi.map_coordinates(transformed_image2.numpy()[0], indices, order=1, mode='reflect').reshape(shape)
-
-    # Retourner les images transformées sous forme de tenseurs PyTorch
-    return torch.tensor(distorted_image1, dtype=torch.float32).unsqueeze(0), torch.tensor(distorted_image2, dtype=torch.float32).unsqueeze(0)
-
-def apply_transformations_to_pairs(dir1, dir2, output_dir1, output_dir2):
-    # Assurez-vous que les dossiers de sortie existent
-    os.makedirs(output_dir1, exist_ok=True)
-    os.makedirs(output_dir2, exist_ok=True)
-    
-    # Parcourir tous les fichiers dans le premier répertoire
-    for filename in os.listdir(dir1):
-        if filename in os.listdir(dir2):
-            # Charger les deux images
-            image_path1 = os.path.join(dir1, filename)
-            image_path2 = os.path.join(dir2, filename)
-            
-            image1 = tiff.imread(image_path1)
-            image2 = tiff.imread(image_path2)
-            
-            image_tensor1 = torch.tensor(image1, dtype=torch.float32).unsqueeze(0)
-            image_tensor2 = torch.tensor(image2, dtype=torch.float32).unsqueeze(0)
-            
-            # Appliquer les transformations synchronisées
-            transformed_image1, transformed_image2 = synchronized_transform_3d(image_tensor1, image_tensor2)
-            
-            # Sauvegarder les images transformées
-            tiff.imwrite(os.path.join(output_dir1, filename), transformed_image1.squeeze(0).numpy())
-            tiff.imwrite(os.path.join(output_dir2, filename), transformed_image2.squeeze(0).numpy())
-
-# Exemple d'utilisation
-dir1 = 'path_to_directory1'
-dir2 = 'path_to_directory2'
-output_dir1 = 'path_to_output_directory1'
-output_dir2 = 'path_to_output_directory2'
-
-apply_transformations_to_pairs(dir1, dir2, output_dir1, output_dir2)
-
-
+class Config:
+    pass
 
 if __name__ == "__main__":
 
     
     # Hard-coded configuration
-    
     config = Config()
-    config.model_path = "./model_3d_opti.pth"  # Change to your model path
-    config.input_dir = "./training/source/"  # Change to your input images directory
-    config.output_dir = "./predictions"  # Change to your output directory
-    config.batch_size = 1
-    config.target_shape = 192
+    config.model_path = "./pca_based_dataset/models/"  # Change to your model path
+    config.input_dir = "./pca_based_dataset/input/"  # Change to your input images directory
+    config.output_dir = "./pca_based_dataset/ouput/"  # Change to your output directory
+    config.batch_size = 5
+    config.target_shape = 264
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    train_source_dir = "/home/sbourgeat/Project/MachineLearning/UNET/training/source/"  # "/home/sbourgeat/Project/MachineLearning/UNET/cropped_training/cropped_training/source"
-    train_target_dir = "/home/sbourgeat/Project/MachineLearning/UNET/training/target/"  # "/home/sbourgeat/Project/MachineLearning/UNET/cropped_training/cropped_training/target_binarized"
-    test_source_dir = "/home/sbourgeat/Project/MachineLearning/UNET/test/source/"  # #(
-    #    "/home/sbourgeat/Project/MachineLearning/UNET/cropped_test/cropped_test/source"
-    # )
-    test_target_dir = "/home/sbourgeat/Project/MachineLearning/UNET/test/target/"  # #"/home/sbourgeat/Project/MachineLearning/UNET/cropped_test/cropped_test/target_binarized"
-    
+    train_source_dir = "./pca_based_dataset/trainset/source_train/"  # "/home/sbourgeat/Project/MachineLearning/UNET/cropped_training/cropped_training/source"
+    train_target_dir = "./pca_based_dataset/trainset/target_train/"  # "/home/sbourgeat/Project/MachineLearning/UNET/cropped_training/cropped_training/target_binarized"
+    test_source_dir = "./pca_based_dataset/testset/source_test/" #  "/home/sbourgeat/Project/MachineLearning/UNET/cropped_test/cropped_test/source"
+    test_target_dir = "./pca_based_dataset/testset/target_test/" #"/home/sbourgeat/Project/MachineLearning/UNET/cropped_test/cropped_test/target_binarized"
+
+
     # Load datasets
     
-    train_source = load_images(train_source_dir, config.target_shape)
+    train_source = load_images(train_source_dir, config.target_shape)  
     train_target = load_images(train_target_dir, config.target_shape)
     test_source = load_images(test_source_dir, config.target_shape)
     test_target = load_images(test_target_dir, config.target_shape)
