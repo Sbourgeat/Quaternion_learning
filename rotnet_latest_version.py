@@ -12,8 +12,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
-import scipy.ndimage as ndi
-
+import scipy.ndimage as nd
+from scipy.spatial.transform import Rotation as R
+from scipy.ndimage import map_coordinates
+from scipy.optimize import minimize
+from sklearn.decomposition import PCA
 
 def load_images(directory_path, target_shape):
     
@@ -75,8 +78,9 @@ def quat_finder(images):
     for image in images:
         
         # Step 1: Extract coordinates of non-zero voxels
+        #activated_coords = np.array(np.where(image > 0)).T
+        image = image.cpu()  # Move the tensor to CPU
         activated_coords = np.array(np.where(image > 0)).T
-        
         # Step 2: Perform PCA
         pca = PCA(n_components=3)
         pca.fit(activated_coords)
@@ -93,33 +97,42 @@ def quat_finder(images):
 
     return quaternions
 
+
 class CustomDataset(Dataset):
-    def __init__(self, source_images, downsampling_factor):
+    def __init__(
+        self, source_images, target_images, downsampling_factor = 1, augment=False
+    ):
         self.source_images = torch.tensor(source_images, dtype=torch.float32)
-        
-        # Assurez-vous que la forme est correcte avant d'interpoler
-        print("Initial shape:", self.source_images.shape)
-        
-        # Interpolation attend (batch_size, channels, depth, height, width)
-        self.source_images = self.source_images.permute(0, 4, 2, 3, 1)  # Reorder to match (N, C, D, H, W)
-        
-        print("Shape before interpolation:", self.source_images.shape)
-        
+        self.source_images = self.source_images.permute(0, 4, 1, 2, 3)
         self.source_images = torch.nn.functional.interpolate(
-            self.source_images, scale_factor=1 / downsampling_factor, mode='trilinear', align_corners=False
+            self.source_images, scale_factor=1 / downsampling_factor
         )
-        
-        print("Shape after interpolation:", self.source_images.shape)
-        
-        self.source_images = self.source_images.permute(0, 2, 3, 4, 1)  # Revert to original order (N, D, H, W, C)
+        self.source_images = self.source_images.permute(0, 2, 3, 4, 1)
+        self.target_images = torch.tensor(target_images, dtype=torch.float32)
+        self.target_images = self.target_images.permute(0, 4, 1, 2, 3)
+        self.target_images = torch.nn.functional.interpolate(
+            self.target_images, scale_factor=1 / downsampling_factor
+        )
+        self.target_images = self.target_images.permute(0, 2, 3, 4, 1)
+        self.augment = augment
 
-        def __len__(self):
+    def __len__(self):
+        return len(self.source_images)
 
-            return len(self.source_images)
+    def shape(self):
+        return self.source_images.shape
 
-        def __getitem__(self, idx):
-            # Retourner l'image à l'index donné
-            return self.source_images[idx]
+    def __getitem__(self, idx):
+        source, target = self.source_images[idx], self.target_images[idx]
+        if self.augment:
+            sample = tio.Subject(
+                source=tio.ScalarImage(tensor=source),
+                target=tio.LabelMap(tensor=target),
+            )
+            sample = self.transforms(sample)
+            source, target = sample.source.tensor, sample.target.tensor
+        return source, target
+
 
 
 # Définition du modèle
@@ -137,25 +150,26 @@ class OrientationNetQuaternion(nn.Module):
         self.conv3 = nn.Conv3d(32, 64, kernel_size=3, stride=1, padding=1)
         
         # Fully connected layers
-        
-        self.fc1 = nn.Linear(64 * 8 * 8 * 8, 512)  # Adjust according to input size
+        self.fc1 = nn.Linear(2299968, 512)
+        #self.fc1 = nn.Linear(64 * 4 * 4 * 4, 512)  # Adjust according to input size
         self.fc2 = nn.Linear(512, 128)
         self.fc3 = nn.Linear(128, 4)  # Output 4 quaternions
     
     def forward(self, x):
-
+        x = x.permute(0, 4, 1, 2, 3)
         x = F.relu(self.conv1(x))
         x = F.max_pool3d(x, 2)
         x = F.relu(self.conv2(x))
         x = F.max_pool3d(x, 2)
         x = F.relu(self.conv3(x))
         x = F.max_pool3d(x, 2)
-        x = x.view(x.size(0), -1)  # Flatten the tensor
+        x = x.reshape(x.size(0), -1)  # Flatten the tensor
         x = F.relu(self.fc1(x))
         x = F.relu(self.fc2(x))
         x = self.fc3(x)  # Output the quaternion
+        out = x
 
-        return x
+        return out
 
 # Fonction d'entraînement
 
@@ -203,6 +217,12 @@ if __name__ == "__main__":
     config.output_dir = "./pca_based_dataset/ouput/"  # Change to your output directory
     config.batch_size = 5
     config.target_shape = 264
+    config.num_epochs = 500
+    config.learning_rate = 1e-3
+
+
+
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     train_source_dir = "./pca_based_dataset/trainset/source_train/"  # "/home/sbourgeat/Project/MachineLearning/UNET/cropped_training/cropped_training/source"
     train_target_dir = "./pca_based_dataset/trainset/target_train/"  # "/home/sbourgeat/Project/MachineLearning/UNET/cropped_training/cropped_training/target_binarized"
@@ -231,9 +251,12 @@ if __name__ == "__main__":
 
     ### MODEL CREATION #################################################################################
     
-    model = OrientationNetQuaternion(dropout=config.dropout)
+    model = OrientationNetQuaternion()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
+
+    optimizer = optim.Adam(model.parameters(), lr=config.learning_rate)
+
     
     # Early stopping parameters
     
