@@ -12,7 +12,6 @@ from torch.utils.data import DataLoader, TensorDataset
 import scipy.ndimage as ndi
 
 def synchronized_transform_3d(image_tensor1, image_tensor2):
-    
     # Paramètres aléatoires pour la transformation affine
     angle1 = np.random.uniform(-25, 25)  # Rotation aléatoire en degrés
     angle2 = 0
@@ -21,18 +20,19 @@ def synchronized_transform_3d(image_tensor1, image_tensor2):
     shear = np.random.uniform(-10, 10, size=3)  # Cisaillement aléatoire
 
     matrix1 = torch.tensor([
-    [scale * np.cos(np.radians(angle1)), -np.sin(np.radians(angle1)), 0, translation[0]],
-    [np.sin(np.radians(angle1)), scale * np.cos(np.radians(angle1)), 0, translation[1]],
-    [0, 0, scale, translation[2]]], dtype=torch.float32)
+        [scale * np.cos(np.radians(angle1)), -np.sin(np.radians(angle1)), 0, translation[0]],
+        [np.sin(np.radians(angle1)), scale * np.cos(np.radians(angle1)), 0, translation[1]],
+        [0, 0, scale, translation[2]]
+    ], dtype=torch.float32)
 
     matrix2 = torch.tensor([
-    [scale * np.cos(np.radians(angle2)), -np.sin(np.radians(angle2)), 0, translation[0]],
-    [np.sin(np.radians(angle2)), scale * np.cos(np.radians(angle2)), 0, translation[1]],
-    [0, 0, scale, translation[2]]], dtype=torch.float32)
-    
+        [scale * np.cos(np.radians(angle2)), -np.sin(np.radians(angle2)), 0, translation[0]],
+        [np.sin(np.radians(angle2)), scale * np.cos(np.radians(angle2)), 0, translation[1]],
+        [0, 0, scale, translation[2]]
+    ], dtype=torch.float32)
 
     # Ajoutez une dimension pour N (le batch)
-    matrix1 = matrix1.unsqueeze(0)  # Correctement dimensionné pour un batch
+    matrix1 = matrix1.unsqueeze(0)
     matrix2 = matrix2.unsqueeze(0)
 
     # Appliquer la transformation affine aux deux images
@@ -42,38 +42,34 @@ def synchronized_transform_3d(image_tensor1, image_tensor2):
     affine_grid2 = F.affine_grid(matrix2, image_tensor2.size(), align_corners=False)
     transformed_image2 = F.grid_sample(image_tensor2, affine_grid2, align_corners=False)
 
-    # Paramètres aléatoires pour la déformation élastique
-    alpha = np.random.uniform(100, 300)  # Déformation moyenne
-    sigma = np.random.uniform(30, 80)  # Douceur de la déformation
+    # Normaliser les images transformées
+    transformed_image1 = torch.clamp(transformed_image1, 0, 1)
+    transformed_image2 = torch.clamp(transformed_image2, 0, 1)
 
-    # Créer des déplacements aléatoires
+    # Paramètres aléatoires pour la déformation élastique
+    alpha = np.random.uniform(100, 300)
+    sigma = np.random.uniform(30, 80)
+
     random_state = np.random.RandomState(None)
     shape = transformed_image1.shape[-3:]
     dx = ndi.gaussian_filter((random_state.rand(*shape) * 2 - 1), sigma, mode="constant", cval=0) * alpha
     dy = ndi.gaussian_filter((random_state.rand(*shape) * 2 - 1), sigma, mode="constant", cval=0) * alpha
     dz = ndi.gaussian_filter((random_state.rand(*shape) * 2 - 1), sigma, mode="constant", cval=0) * alpha
 
-    # Créer des grilles de coordonnées et appliquer les déplacements
     x, y, z = np.meshgrid(np.arange(shape[0]), np.arange(shape[1]), np.arange(shape[2]), indexing='ij')
+    indices = np.array([x + dx, y + dy, z + dz]).reshape(3, *shape)
 
-    # Ajuster les indices pour correspondre à la forme attendue par map_coordinates
-    indices = np.array([x + dx, y + dy, z + dz])
-
-    # Reshape indices pour qu'ils aient la forme correcte
-    indices = indices.reshape(3, *shape)
-    
-    print("Adjusted shape of indices:", indices.shape)
-
-    # Appliquer les coordonnées aux images transformées
     distorted_image1 = ndi.map_coordinates(transformed_image1.numpy()[0, 0], indices, order=1, mode='reflect')
     distorted_image2 = ndi.map_coordinates(transformed_image2.numpy()[0, 0], indices, order=1, mode='reflect')
 
-    # Reshape les images distordues pour revenir à la forme originale
-    distorted_image1 = distorted_image1.reshape(shape)
-    distorted_image2 = distorted_image2.reshape(shape)
+    # Normaliser les images distordues
+    distorted_image1 = np.clip(distorted_image1, 0, 1)
+    distorted_image2 = np.clip(distorted_image2, 0, 1)
 
     # Retourner les images transformées sous forme de tenseurs PyTorch
     return torch.tensor(distorted_image1, dtype=torch.float32).unsqueeze(0), torch.tensor(distorted_image2, dtype=torch.float32).unsqueeze(0)
+
+
 
 def apply_transformations_to_pairs(dir1, dir2):
     # Parcourir tous les fichiers dans le premier répertoire
@@ -100,9 +96,34 @@ def apply_transformations_to_pairs(dir1, dir2):
                 tiff.imwrite(os.path.join(dir1, transformed_filename1), transformed_image1.squeeze(0).numpy())
                 tiff.imwrite(os.path.join(dir2, transformed_filename2), transformed_image2.squeeze(0).numpy())
 
+def delete_transformed_images(dir_path):
+    # Parcourir tous les fichiers dans le répertoire donné
+    for filename in os.listdir(dir_path):
+        # Vérifier si le nom du fichier contient le motif '_transformed_'
+        if '_transformed_' in filename:
+            file_path = os.path.join(dir_path, filename)
+            try:
+                os.remove(file_path)
+                print(f"Deleted: {file_path}")
+            except Exception as e:
+                print(f"Could not delete {file_path}: {e}")
+
 
 if __name__ == "__main__":
+    # Répertoires contenant les images transformées
+    dir1 = './pca_based_dataset/trainset/source_train/'
+    dir2 = './pca_based_dataset/trainset/target_train/'
+    dir3 = './pca_based_dataset/testset/source_test/'
+    dir4 = './pca_based_dataset/testset/target_test/'
+    # Supprimer les images transformées dans les deux répertoires
+    delete_transformed_images(dir1)
+    delete_transformed_images(dir2)
+    delete_transformed_images(dir3)
+    delete_transformed_images(dir4)
+
+
+#if __name__ == "__main__":
     
-    dir1 = './pca_based_dataset/source/'
-    dir2 = './pca_based_dataset/target/'
-    apply_transformations_to_pairs(dir1, dir2)
+ #   dir1 = './pca_based_dataset/source/'
+  #  dir2 = './pca_based_dataset/target/'
+  #  apply_transformations_to_pairs(dir1, dir2)

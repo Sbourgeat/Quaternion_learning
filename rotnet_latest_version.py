@@ -70,32 +70,34 @@ def binarize_targets(target_path, threshold = 0.1):
 
     return targets
 
-
 def quat_finder(images):
-    
     quaternions = []
 
     for image in images:
-        
-        # Step 1: Extract coordinates of non-zero voxels
-        #activated_coords = np.array(np.where(image > 0)).T
-        image = image.cpu()  # Move the tensor to CPU
-        activated_coords = np.array(np.where(image > 0)).T
-        # Step 2: Perform PCA
+        # Convertir le tenseur sur le CPU
+        image = image.cpu()
+        activated_coords = np.array(np.where(image > 0)).T[:, :3]  # Ne garder que les 3 premières dimensions
+        print(f"Number of activated points: {activated_coords.shape[0]}")
+
+        # PCA avec 3 composantes
         pca = PCA(n_components=3)
         pca.fit(activated_coords)
-        
-        # Get the principal components
+
+        # Obtenir les composantes principales
         principal_components = pca.components_
-        
-        # Step 3: Use the principal components to define a rotation quaternion
+
+        # Vérification de la forme
+        if principal_components.shape != (3, 3):
+            raise ValueError(f"Unexpected shape for principal_components: {principal_components.shape}")
+
+        # Utiliser les composantes principales pour définir une matrice de rotation
         rotation_matrix = principal_components.T
         rotation_quaternion = R.from_matrix(rotation_matrix).as_quat()
         quaternions.append(rotation_quaternion)
 
     quaternions = torch.from_numpy(np.array(quaternions))
-
     return quaternions
+
 
 
 class CustomDataset(Dataset):
