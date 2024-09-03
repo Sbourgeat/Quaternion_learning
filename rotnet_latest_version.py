@@ -19,24 +19,58 @@ from scipy.optimize import minimize
 from sklearn.decomposition import PCA
 
 def load_images(directory_path, target_shape):
-    
     images = []
     target_shape = (target_shape, target_shape, target_shape)
 
     for filename in sorted(os.listdir(directory_path)):
-
         if filename.endswith(".tif"):
-            image = tiff.imread(os.path.join(directory_path, filename))
+            image_path = os.path.join(directory_path, filename)
 
-            if image.shape != target_shape:
-                image = resize(
-                    image, target_shape, preserve_range=True, anti_aliasing=True
-                )
-                image = image.astype(np.float32)
-            images.append(image)
+            try:
+                # Chargement de l'image
+                image = tiff.imread(image_path)
+                print(f"Loaded {filename} with shape {image.shape} and dtype {image.dtype}")
+
+                # Vérifie si l'image est vide ou corrompue
+                if image is None or image.size == 0:
+                    print(f"Warning: {filename} is empty or corrupted.")
+                    continue
+
+                # Vérifie que l'image a bien été chargée en 3D
+                if len(image.shape) != 3:
+                    print(f"Warning: {filename} is not a 3D image. Skipping.")
+                    continue
+
+                # Redimensionnement si nécessaire
+                if image.shape != target_shape:
+                    print(f"Resizing {filename} from shape {image.shape} to target shape {target_shape}.")
+                    image = resize(image, target_shape, preserve_range=True, anti_aliasing=True)
+                    image = image.astype(np.float32)
+
+                # Vérifie si l'image a été redimensionnée correctement
+                if image.shape != target_shape:
+                    print(f"Warning: {filename} could not be resized properly to {target_shape}. Skipping.")
+                    continue
+
+                # Ajout de l'image à la liste
+                images.append(image)
+
+            except Exception as e:
+                print(f"Error loading {filename}: {e}")
+                continue
+
+    # Conversion en tableau NumPy
     images = np.array(images)
-    images = np.expand_dims(images, axis=-1)  # Add channel dimension
 
+    # Vérifie si des images ont été chargées
+    if len(images) == 0:
+        print("No images were loaded successfully. Check the input directory or file formats.")
+        return images
+
+    # Ajouter la dimension de canal
+    images = np.expand_dims(images, axis=-1)
+
+    print(f"Total images loaded: {len(images)}")
     return images
 
 
@@ -56,7 +90,7 @@ def normalize(source_images):
     return normalized_images
 
 
-def binarize_targets(target_path, threshold = 0.1):
+def binarize_targets(target_path, threshold = 0.005):
     
     binarized_image = []
 
@@ -70,13 +104,12 @@ def binarize_targets(target_path, threshold = 0.1):
 
     return targets
 
-
 def quat_finder(images):
     quaternions = []
 
     for image in images:
         # Convertir le tenseur sur le CPU
-        image = image.cpu()
+        image = image.cpu().detach()  # Assurez-vous qu'il n'y a pas de gradient attaché
         activated_coords = np.array(np.where(image > 0)).T[:, :3]  # Ne garder que les 3 premières dimensions
         num_activated_points = activated_coords.shape[0]
         print(f"Number of activated points: {num_activated_points}")
@@ -98,49 +131,12 @@ def quat_finder(images):
         # Obtenir les composantes principales
         principal_components = pca.components_
 
-        # Vérification de la forme
+        # Vérification de la forme des composantes principales
         if principal_components.shape != (3, 3):
-            raise ValueError(f"Unexpected shape for principal_components: {principal_components.shape}")
-
-        # Utiliser les composantes principales pour définir une matrice de rotation
-        rotation_matrix = principal_components.T
-        rotation_quaternion = R.from_matrix(rotation_matrix).as_quat()
-        quaternions.append(rotation_quaternion)
-
-    quaternions = torch.from_numpy(np.array(quaternions))
-    return quaternions
-
-
-def quat_finder(images):
-    quaternions = []
-
-    for image in images:
-        # Convertir le tenseur sur le CPU et s'assurer qu'il a requires_grad=False
-        image = image.cpu().detach()  # Utiliser detach() pour s'assurer qu'il n'y a pas de gradient attaché
-        activated_coords = np.array(np.where(image > 0)).T[:, :3]  # Ne garder que les 3 premières dimensions
-        num_activated_points = activated_coords.shape[0]
-        print(f"Number of activated points: {num_activated_points}")
-
-        # Vérifier s'il y a suffisamment de points pour la PCA
-        if num_activated_points < 3:
-            print("Not enough points for PCA. Skipping this image.")
+            print(f"Warning: PCA did not return a (3, 3) matrix. Received shape: {principal_components.shape}")
             # Ajouter un quaternion par défaut ou une autre méthode de traitement
             quaternions.append(np.array([1, 0, 0, 0]))  # Quaternion neutre par exemple
             continue
-
-        # Définir n_components de manière dynamique
-        n_components = min(3, num_activated_points, activated_coords.shape[1])
-        
-        # PCA avec le nombre de composantes dynamiquement ajusté
-        pca = PCA(n_components=n_components)
-        pca.fit(activated_coords)
-
-        # Obtenir les composantes principales
-        principal_components = pca.components_
-
-        # Vérification de la forme
-        if principal_components.shape != (3, 3):
-            raise ValueError(f"Unexpected shape for principal_components: {principal_components.shape}")
 
         # Utiliser les composantes principales pour définir une matrice de rotation
         rotation_matrix = principal_components.T
@@ -148,11 +144,9 @@ def quat_finder(images):
         quaternions.append(rotation_quaternion)
 
     # Convertir les quaternions en tenseurs PyTorch
-    quaternions = torch.from_numpy(np.array(quaternions)).float().to(device)
-
-    # Assurer que requires_grad=True si nécessaire
-    quaternions.requires_grad_(True)
-
+    quaternions = torch.from_numpy(np.array(quaternions)).float()
+    quaternions.requires_grad = True  # S'assurer que requires_grad est True
+    
     return quaternions
 
 
@@ -350,7 +344,6 @@ if __name__ == "__main__":
         
         return val_loss, accuracy, dice_score
 
-
 for epoch in range(config.num_epochs):
     model.train()
     running_loss = 0.0
@@ -361,29 +354,43 @@ for epoch in range(config.num_epochs):
         desc=f"Epoch {epoch + 1}/{config.num_epochs}",
         unit="batch",
     ) as pbar:
-
-        for inputs, targets in train_loader:
-            # Assurez-vous que les entrées et les cibles nécessitent un gradient
+        # Boucle d'entraînement
+        for inputs, targets in train_loader:  # Corrigé l'indentation ici
+            # Transfert vers l'appareil GPU/CPU
             inputs, targets = inputs.to(device), targets.to(device)
-            inputs.requires_grad = True
-            targets.requires_grad = True
 
-            optimizer.zero_grad()
+            # Prédiction du modèle
             outputs = model(inputs)
-            
-            # Trouver les quaternions pour les prédictions et les cibles
-            q_target = quat_finder(targets)
-            q_output = quat_finder(outputs)
-            
-            # Calculer la perte
-            loss = criterion(q_output, q_target)
+            # Boucle d'entraînementfor
+
+            # Vérifier les formes initiales
+            print(f"Shape of outputs: {outputs.shape}")
+            print(f"Shape of targets: {targets.shape}")
+
+            # Redimensionner les prédictions pour qu'elles correspondent aux cibles
+            outputs_resized = F.interpolate(outputs, size=targets.shape[2:], mode='trilinear', align_corners=False)
+    
+            # Vérifier que les formes correspondent maintenant
+            print(f"Shape of resized outputs: {outputs_resized.shape}")
+    
+            # Calcul de la perte entre les prédictions redimensionnées et les cibles
+            loss = criterion(outputs_resized, targets)
+    
+            # Rétropropagation
+            optimizer.zero_grad()
             loss.backward()
             optimizer.step()
-            running_loss += loss.item() * inputs.size(0)
-            predicted = outputs
-            correct += (predicted == targets).sum().item()
+    
+            # Calcul de la précision
+            correct += (outputs_resized == targets).sum().item()
             total += targets.numel()
-            pbar.update(1)
+
+            print(f"Current Accuracy: {correct / total:.4f}")
+
+
+
+
+
 
     # Calcul de la perte d'époque
     epoch_loss = running_loss / len(train_loader.dataset)
@@ -400,6 +407,7 @@ for epoch in range(config.num_epochs):
 
     else:
         early_stop_counter += 1
+
 
         if early_stop_counter >= patience:
             print(f"Early stopping at epoch {epoch + 1}")
