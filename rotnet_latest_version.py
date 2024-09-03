@@ -70,6 +70,7 @@ def binarize_targets(target_path, threshold = 0.1):
 
     return targets
 
+
 def quat_finder(images):
     quaternions = []
 
@@ -77,10 +78,21 @@ def quat_finder(images):
         # Convertir le tenseur sur le CPU
         image = image.cpu()
         activated_coords = np.array(np.where(image > 0)).T[:, :3]  # Ne garder que les 3 premières dimensions
-        print(f"Number of activated points: {activated_coords.shape[0]}")
+        num_activated_points = activated_coords.shape[0]
+        print(f"Number of activated points: {num_activated_points}")
 
-        # PCA avec 3 composantes
-        pca = PCA(n_components=3)
+        # Vérifier s'il y a suffisamment de points pour la PCA
+        if num_activated_points < 3:
+            print("Not enough points for PCA. Skipping this image.")
+            # Ajouter un quaternion par défaut ou une autre méthode de traitement
+            quaternions.append(np.array([1, 0, 0, 0]))  # Quaternion neutre par exemple
+            continue
+
+        # Définir n_components de manière dynamique
+        n_components = min(3, num_activated_points, activated_coords.shape[1])
+        
+        # PCA avec le nombre de composantes dynamiquement ajusté
+        pca = PCA(n_components=n_components)
         pca.fit(activated_coords)
 
         # Obtenir les composantes principales
@@ -98,6 +110,50 @@ def quat_finder(images):
     quaternions = torch.from_numpy(np.array(quaternions))
     return quaternions
 
+
+def quat_finder(images):
+    quaternions = []
+
+    for image in images:
+        # Convertir le tenseur sur le CPU et s'assurer qu'il a requires_grad=False
+        image = image.cpu().detach()  # Utiliser detach() pour s'assurer qu'il n'y a pas de gradient attaché
+        activated_coords = np.array(np.where(image > 0)).T[:, :3]  # Ne garder que les 3 premières dimensions
+        num_activated_points = activated_coords.shape[0]
+        print(f"Number of activated points: {num_activated_points}")
+
+        # Vérifier s'il y a suffisamment de points pour la PCA
+        if num_activated_points < 3:
+            print("Not enough points for PCA. Skipping this image.")
+            # Ajouter un quaternion par défaut ou une autre méthode de traitement
+            quaternions.append(np.array([1, 0, 0, 0]))  # Quaternion neutre par exemple
+            continue
+
+        # Définir n_components de manière dynamique
+        n_components = min(3, num_activated_points, activated_coords.shape[1])
+        
+        # PCA avec le nombre de composantes dynamiquement ajusté
+        pca = PCA(n_components=n_components)
+        pca.fit(activated_coords)
+
+        # Obtenir les composantes principales
+        principal_components = pca.components_
+
+        # Vérification de la forme
+        if principal_components.shape != (3, 3):
+            raise ValueError(f"Unexpected shape for principal_components: {principal_components.shape}")
+
+        # Utiliser les composantes principales pour définir une matrice de rotation
+        rotation_matrix = principal_components.T
+        rotation_quaternion = R.from_matrix(rotation_matrix).as_quat()
+        quaternions.append(rotation_quaternion)
+
+    # Convertir les quaternions en tenseurs PyTorch
+    quaternions = torch.from_numpy(np.array(quaternions)).float().to(device)
+
+    # Assurer que requires_grad=True si nécessaire
+    quaternions.requires_grad_(True)
+
+    return quaternions
 
 
 class CustomDataset(Dataset):
@@ -253,15 +309,17 @@ if __name__ == "__main__":
 
     ### MODEL CREATION #################################################################################
     
+    # MODEL CREATION
     model = OrientationNetQuaternion()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
 
+    # Définir la fonction de perte
+    criterion = nn.MSELoss()  # Par exemple, pour une régression de quaternions
+
     optimizer = optim.Adam(model.parameters(), lr=config.learning_rate)
 
-    
     # Early stopping parameters
-    
     patience = 20
     best_val_loss = float("inf")
     early_stop_counter = 0
@@ -293,64 +351,60 @@ if __name__ == "__main__":
         return val_loss, accuracy, dice_score
 
 
-    for epoch in range(config.num_epochs):
-        model.train()
-        running_loss = 0.0
-        correct = 0
-        total = 0
-        with tqdm(
-            total=len(train_loader),
-            desc=f"Epoch {epoch + 1}/{config.num_epochs}",
-            unit="batch",
-        ) as pbar:
+for epoch in range(config.num_epochs):
+    model.train()
+    running_loss = 0.0
+    correct = 0
+    total = 0
+    with tqdm(
+        total=len(train_loader),
+        desc=f"Epoch {epoch + 1}/{config.num_epochs}",
+        unit="batch",
+    ) as pbar:
 
-            for inputs, targets in train_loader:
-                inputs, targets = inputs.to(device), targets.to(device)
-                optimizer.zero_grad()
-                outputs = model(inputs)
-                q_target = quat_finder(targets)
-                q_output = quat_finder(outputs)
-                loss = criterion(q_outputs, q_targets)
-                loss.backward()
-                optimizer.step()
-                running_loss += loss.item() * inputs.size(0)
-                predicted = outputs
-                correct += (predicted == targets).sum().item()
-                total += targets.numel()
-                pbar.update(1)
-        epoch_loss = running_loss / len(train_loader.dataset)
-        epoch_accuracy = correct / total
-        val_loss, val_accuracy, val_dice = evaluate(
-            model, test_loader, criterion, device, epoch
-        )
+        for inputs, targets in train_loader:
+            # Assurez-vous que les entrées et les cibles nécessitent un gradient
+            inputs, targets = inputs.to(device), targets.to(device)
+            inputs.requires_grad = True
+            targets.requires_grad = True
 
-        # Early stopping
-
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            early_stop_counter = 0
-            torch.save(model.state_dict(), "best_model_3d_aug.pth")
-
-        else:
-            early_stop_counter += 1
-
-            if early_stop_counter >= patience:
-                print(f"Early stopping at epoch {epoch + 1}")
-                break
-    torch.save(model.state_dict(), "model_3d_aug.pth")
-    wandb.finish()
-    
-    # Perform predictions
-    
-    predictions = []
-    with torch.no_grad():
-
-        for inputs in tqdm(dataloader):
-            inputs = inputs.to(device)
+            optimizer.zero_grad()
             outputs = model(inputs)
-            predictions.extend(outputs.cpu().numpy())
-    
-    # Save the predictions
-    
-    save_predictions(predictions, config.output_dir, original_shape)
-    print(f"Predictions saved to {config.output_dir}.")
+            
+            # Trouver les quaternions pour les prédictions et les cibles
+            q_target = quat_finder(targets)
+            q_output = quat_finder(outputs)
+            
+            # Calculer la perte
+            loss = criterion(q_output, q_target)
+            loss.backward()
+            optimizer.step()
+            running_loss += loss.item() * inputs.size(0)
+            predicted = outputs
+            correct += (predicted == targets).sum().item()
+            total += targets.numel()
+            pbar.update(1)
+
+    # Calcul de la perte d'époque
+    epoch_loss = running_loss / len(train_loader.dataset)
+    epoch_accuracy = correct / total
+    val_loss, val_accuracy, val_dice = evaluate(
+        model, test_loader, criterion, device, epoch
+    )
+
+    # Early stopping logic
+    if val_loss < best_val_loss:
+        best_val_loss = val_loss
+        early_stop_counter = 0
+        torch.save(model.state_dict(), "best_model_3d_aug.pth")
+
+    else:
+        early_stop_counter += 1
+
+        if early_stop_counter >= patience:
+            print(f"Early stopping at epoch {epoch + 1}")
+            break
+
+# Sauvegarder le modèle final après l'entraînement
+torch.save(model.state_dict(), "model_3d_aug.pth")
+wandb.finish()
