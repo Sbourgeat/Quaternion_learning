@@ -327,7 +327,7 @@ if __name__ == "__main__":
                 outputs = model(inputs)
                 q_target = quat_finder(targets)
                 q_output = quat_finder(outputs)
-                loss = criterion(q_outputs, q_targets)
+                loss = criterion(q_output, q_target)
                 val_loss += loss.item() * inputs.size(0)
                 predicted = (outputs > 0.5).float()
                 correct += (predicted == targets).sum().item()
