@@ -192,21 +192,17 @@ class CustomDataset(Dataset):
 class OrientationNetQuaternion(nn.Module):
     
     def __init__(self):
-
         super(OrientationNetQuaternion, self).__init__()
-        
         # 3D convolutional layers
-        
         self.conv1 = nn.Conv3d(1, 16, kernel_size=3, stride=1, padding=1)
         self.conv2 = nn.Conv3d(16, 32, kernel_size=3, stride=1, padding=1)
         self.conv3 = nn.Conv3d(32, 64, kernel_size=3, stride=1, padding=1)
         
         # Fully connected layers
-        self.fc1 = nn.Linear(2299968, 512)
-        #self.fc1 = nn.Linear(64 * 4 * 4 * 4, 512)  # Adjust according to input size
+        self.fc1 = nn.Linear(64 * 33 * 33 * 33, 512)  # Remplacez cette taille par la taille correcte calculée dynamiquement
         self.fc2 = nn.Linear(512, 128)
         self.fc3 = nn.Linear(128, 4)  # Output 4 quaternions
-    
+
     def forward(self, x):
         x = x.permute(0, 4, 1, 2, 3)
         x = F.relu(self.conv1(x))
@@ -215,13 +211,12 @@ class OrientationNetQuaternion(nn.Module):
         x = F.max_pool3d(x, 2)
         x = F.relu(self.conv3(x))
         x = F.max_pool3d(x, 2)
-        x = x.reshape(x.size(0), -1)  # Flatten the tensor
+        x = x.reshape(x.size(0), -1)  # Aplatir le tenseur de manière dynamique
         x = F.relu(self.fc1(x))
         x = F.relu(self.fc2(x))
         x = self.fc3(x)  # Output the quaternion
-        out = x
+        return x
 
-        return out
 
 # Fonction d'entraînement
 
@@ -267,7 +262,7 @@ if __name__ == "__main__":
     config.model_path = "./pca_based_dataset/models/"  # Change to your model path
     config.input_dir = "./pca_based_dataset/input/"  # Change to your input images directory
     config.output_dir = "./pca_based_dataset/ouput/"  # Change to your output directory
-    config.batch_size = 5
+    config.batch_size = 3
     config.target_shape = 264
     config.num_epochs = 500
     config.learning_rate = 1e-3
@@ -344,74 +339,112 @@ if __name__ == "__main__":
         
         return val_loss, accuracy, dice_score
 
-for epoch in range(config.num_epochs):
-    model.train()
-    running_loss = 0.0
-    correct = 0
-    total = 0
-    with tqdm(
-        total=len(train_loader),
-        desc=f"Epoch {epoch + 1}/{config.num_epochs}",
-        unit="batch",
-    ) as pbar:
-        # Boucle d'entraînement
-        for inputs, targets in train_loader:  # Corrigé l'indentation ici
-            # Transfert vers l'appareil GPU/CPU
-            inputs, targets = inputs.to(device), targets.to(device)
 
-            # Prédiction du modèle
-            outputs = model(inputs)
-            # Boucle d'entraînementfor
+    for epoch in range(config.num_epochs):
+        model.train()
+        running_loss = 0.0
+        correct = 0
+        total = 0
+        with tqdm(
+            total=len(train_loader),
+            desc=f"Epoch {epoch + 1}/{config.num_epochs}",
+            unit="batch",
+        ) as pbar:
+            for inputs, targets in train_loader:
+                # Transfert vers l'appareil GPU/CPU
+                inputs, targets = inputs.to(device), targets.to(device)
 
-            # Vérifier les formes initiales
-            print(f"Shape of outputs: {outputs.shape}")
-            print(f"Shape of targets: {targets.shape}")
+                # Prédiction du modèle
+                outputs = model(inputs)
 
-            # Redimensionner les prédictions pour qu'elles correspondent aux cibles
-            outputs_resized = F.interpolate(outputs, size=targets.shape[2:], mode='trilinear', align_corners=False)
+                # Affichez la forme de `outputs` après la prédiction
+                print(f"Shape of outputs after model prediction: {outputs.shape}")
+                
+                # Ajuster le redimensionnement de 'outputs' en fonction de sa forme réelle
+
+                if outputs.dim() == 2:
+                    # Cas où 'outputs' est aplati avec deux dimensions (batch_size, num_features)
+                    print(f"Flattened shape of outputs: {outputs.shape}")
+
+                    # Calculez le nombre total d'éléments
+                    total_elements = outputs.size(0) * outputs.size(1)
+                    expected_elements = config.target_shape * config.target_shape * config.target_shape
     
-            # Vérifier que les formes correspondent maintenant
-            print(f"Shape of resized outputs: {outputs_resized.shape}")
-    
-            # Calcul de la perte entre les prédictions redimensionnées et les cibles
-            loss = criterion(outputs_resized, targets)
-    
-            # Rétropropagation
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-    
-            # Calcul de la précision
-            correct += (outputs_resized == targets).sum().item()
-            total += targets.numel()
+                    # Vérifiez que le nombre total d'éléments correspond
+                    if total_elements == expected_elements:
+                        # Effectuez le redimensionnement si le nombre d'éléments est correct
+                        outputs = outputs.view(-1, 1, config.target_shape, config.target_shape, config.target_shape)
+                    else:
+                        print(f"Cannot reshape outputs from size {outputs.size()} to target shape {config.target_shape}.")
+                        continue
 
-            print(f"Current Accuracy: {correct / total:.4f}")
+                elif outputs.dim() == 4:
+                    # Si 'outputs' a 4 dimensions (N, D, H, W), ajoutez une dimension de canal
+                    outputs = outputs.unsqueeze(1)  # Ajoute une dimension de canal pour obtenir (N, C, D, H, W)
 
+                else:
+                    print("Output tensor has unexpected number of dimensions. Check the model's output.")
+                    continue
 
 
+                print(f"Shape of outputs after adjustment: {outputs.shape}")
+
+                # Assurez-vous que 'targets' a également le bon format
+                if targets.dim() == 4:
+                    targets = targets.unsqueeze(1)  # Ajouter une dimension de canal pour correspondre au format (N, C, D, H, W)
+
+                # Redimensionner les prédictions pour qu'elles correspondent aux cibles
+                outputs_resized = F.interpolate(
+                    outputs, 
+                    size=(targets.shape[2], targets.shape[3], targets.shape[4]), 
+                    mode='trilinear', 
+                    align_corners=False
+                )
+
+                print(f"Shape of resized outputs: {outputs_resized.shape}")
+
+                # Calcul de la perte entre les prédictions redimensionnées et les cibles
+                loss = criterion(outputs_resized, targets)
+
+                # Rétropropagation
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+
+                # Calcul de la précision
+                correct += (outputs_resized == targets).sum().item()
+                total += targets.numel()
+
+                print(f"Current Accuracy: {correct / total:.4f}")
 
 
 
-    # Calcul de la perte d'époque
-    epoch_loss = running_loss / len(train_loader.dataset)
-    epoch_accuracy = correct / total
-    val_loss, val_accuracy, val_dice = evaluate(
-        model, test_loader, criterion, device, epoch
-    )
+        # Calcul de la perte d'époque
+        epoch_loss = running_loss / len(train_loader.dataset)
 
-    # Early stopping logic
-    if val_loss < best_val_loss:
-        best_val_loss = val_loss
-        early_stop_counter = 0
-        torch.save(model.state_dict(), "best_model_3d_aug.pth")
+        if total > 0:
+            epoch_accuracy = correct / total
+        else:
+            epoch_accuracy = 0
+            print("Warning: Total number of targets is zero, accuracy set to 0.")
 
-    else:
-        early_stop_counter += 1
+        val_loss, val_accuracy, val_dice = evaluate(
+            model, test_loader, criterion, device, epoch
+        )
+
+        # Early stopping logic
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            early_stop_counter = 0
+            torch.save(model.state_dict(), "best_model_3d_aug.pth")
+
+        else:
+            early_stop_counter += 1
 
 
-        if early_stop_counter >= patience:
-            print(f"Early stopping at epoch {epoch + 1}")
-            break
+            if early_stop_counter >= patience:
+                print(f"Early stopping at epoch {epoch + 1}")
+                break
 
 # Sauvegarder le modèle final après l'entraînement
 torch.save(model.state_dict(), "model_3d_aug.pth")
